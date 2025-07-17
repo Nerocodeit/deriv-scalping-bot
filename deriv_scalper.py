@@ -8,39 +8,30 @@ import pandas as pd
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from dotenv import load_dotenv
-import socket
 
-# Load .env variables
+# Load env variables
 load_dotenv()
 
 DERIV_TOKEN = os.getenv("DERIV_API_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-STAKE = 0.35  # Stake per trade
-LOSS_LIMIT = 3
+STAKE = 0.35  # $ per trade
+LOSS_LIMIT = 3  # Stop after 3 losses
 
 loss_count = 0
 
-
 async def send_telegram(msg):
-    """Send a message to your Telegram bot"""
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            response = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-            if not response.ok:
-                print(f"[Telegram Error] {response.text}")
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
         except Exception as e:
-            print(f"[Telegram Exception] {e}")
-    else:
-        print("[Error] Telegram token or chat ID not found in environment variables.")
-
+            print("Telegram send error:", e)
 
 async def get_candles():
-    """Fetch 50 candles (1-min) from Deriv for R_50 index"""
     try:
-        async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
-            request = {
+        async with websockets.connect("wss://frontend.binaryws.com/websockets/v3?app_id=1089") as ws:
+            req = {
                 "ticks_history": "R_50",
                 "adjust_start_time": 1,
                 "count": 50,
@@ -48,20 +39,18 @@ async def get_candles():
                 "granularity": 60,
                 "style": "candles"
             }
-            await ws.send(json.dumps(request))
-            response = await ws.recv()
-            data = json.loads(response)
+            await ws.send(json.dumps(req))
+            res = await ws.recv()
+            data = json.loads(res)
             candles = data.get("candles", [])
             df = pd.DataFrame(candles)
             df['close'] = df['close'].astype(float)
             return df
     except Exception as e:
-        await send_telegram(f"⚠️ Failed to get candles: {str(e)}")
+        await send_telegram(f"⚠️ Failed to get candles: {e}")
         return None
 
-
 def check_signal(df):
-    """Check EMA cross + RSI for entry signals"""
     df['ema5'] = EMAIndicator(df['close'], 5).ema_indicator()
     df['ema14'] = EMAIndicator(df['close'], 14).ema_indicator()
     df['rsi'] = RSIIndicator(df['close'], 14).rsi()
@@ -75,9 +64,7 @@ def check_signal(df):
         return "PUT"
     return None
 
-
 async def place_trade(signal):
-    """Send trade request to Deriv API"""
     contract_type = "CALL" if signal == "CALL" else "PUT"
     payload = {
         "buy": 1,
@@ -94,88 +81,63 @@ async def place_trade(signal):
         "passthrough": {"signal": signal}
     }
     try:
-        async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
+        async with websockets.connect("wss://frontend.binaryws.com/websockets/v3?app_id=1089") as ws:
             await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             await ws.recv()
             await ws.send(json.dumps(payload))
-            response = await ws.recv()
-            return json.loads(response)
+            res = await ws.recv()
+            return json.loads(res)
     except Exception as e:
-        await send_telegram(f"⚠️ Trade execution failed: {str(e)}")
-        return None
-
-
-async def check_contract_result(contract_id):
-    """Check the result of the trade"""
-    try:
-        async with websockets.connect("wss://ws.deriv.com/websockets/v3?app_id=1089") as ws:
-            await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-            await ws.recv()
-            await ws.send(json.dumps({"contract": contract_id}))
-            data = await ws.recv()
-            return json.loads(data)
-    except Exception as e:
-        await send_telegram(f"⚠️ Error checking result: {str(e)}")
-        return None
-
+        await send_telegram(f"❌ Trade connection error: {e}")
+        return {}
 
 async def run_bot():
     global loss_count
-    await send_telegram("🤖 Deriv Scalper Bot Started.")
-
     while True:
-        if loss_count >= LOSS_LIMIT:
-            await send_telegram("🚫 Stopped after reaching 3 losses.")
-            break
-
         try:
+            if loss_count >= LOSS_LIMIT:
+                await send_telegram("🚫 Bot paused after 3 losses.")
+                break
+
             df = await get_candles()
             if df is None or df.empty:
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
                 continue
 
             signal = check_signal(df)
             if signal:
-                await send_telegram(f"📈 Signal Detected: {signal}")
+                await send_telegram(f"📊 Signal found: {signal}. Placing trade...")
                 result = await place_trade(signal)
 
-                if not result or "error" in result:
-                    error_msg = result.get("error", {}).get("message", "Unknown error")
-                    await send_telegram(f"❌ Trade Error: {error_msg}")
+                if "error" in result:
+                    await send_telegram(f"❌ Trade Error: {result['error']['message']}")
                     break
+                else:
+                    contract_id = result['buy']['contract_id']
+                    await send_telegram(f"✅ Trade Placed: {signal}\nContract ID: {contract_id}")
+                    await asyncio.sleep(65)  # Wait for result
 
-                contract_id = result['buy']['contract_id']
-                await send_telegram(f"✅ Trade placed with Contract ID: {contract_id}")
+                    # Check result
+                    await send_telegram("⏳ Checking result...")
+                    async with websockets.connect("wss://frontend.binaryws.com/websockets/v3?app_id=1089") as ws:
+                        await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+                        await ws.recv()
+                        await ws.send(json.dumps({"contract": contract_id}))
+                        outcome_data = json.loads(await ws.recv())
 
-                await asyncio.sleep(65)  # Wait for result
-
-                await send_telegram("⏳ Checking trade result...")
-                outcome = await check_contract_result(contract_id)
-
-                if outcome:
-                    profit = outcome.get('contract', {}).get('profit')
-                    if profit and float(profit) > 0:
-                        await send_telegram(f"🎯 Win! +${profit}")
-                        loss_count = 0
-                    else:
-                        await send_telegram("🔻 Loss.")
-                        loss_count += 1
+                        profit = outcome_data.get('contract', {}).get('profit')
+                        if profit and float(profit) > 0:
+                            await send_telegram(f"🎯 Win: +${profit}")
+                            loss_count = 0
+                        else:
+                            await send_telegram("🔻 Loss.")
+                            loss_count += 1
             else:
-                await send_telegram("📉 No valid signal.")
-
+                await send_telegram("📉 No valid signal at the moment.")
+            await asyncio.sleep(10)
         except Exception as e:
-            await send_telegram(f"⚠️ Unexpected Error: {str(e)}")
-
-        await asyncio.sleep(10)
-
+            await send_telegram(f"⚠️ Bot crashed with error: {str(e)}")
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    # Debug DNS on startup
-    try:
-        print("🔍 Resolving hostnames...")
-        print("api.telegram.org →", socket.gethostbyname("api.telegram.org"))
-        print("ws.deriv.com →", socket.gethostbyname("ws.deriv.com"))
-    except Exception as e:
-        print("DNS resolution failed:", e)
-
     asyncio.run(run_bot())
